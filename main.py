@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTableWidget,
                                QFormLayout, QDialog, QHeaderView,
                                QDialogButtonBox, QStyledItemDelegate,
                                QSizePolicy)  # 导入 QSizePolicy
-from PySide6.QtCore import Qt, QProcess, QSize, Signal
+from PySide6.QtCore import Qt, QProcess, QSize, Signal, QObject
 from PySide6.QtGui import QIcon, QColor, QPalette
 from ui_mainwindow import Ui_MainWindow
 
@@ -24,6 +24,143 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ------------------------------
+# 日志与命令执行辅助
+# ------------------------------
+
+class _LogEmitter(QObject):
+    """Qt 信号发射器（用于跨线程/跨模块把日志安全地送到 UI）。"""
+
+    message = Signal(str)
+
+
+class QtPlainTextLogHandler(logging.Handler):
+    """将 Python logging 输出同步到 Qt 的 QPlainTextEdit。
+
+    参数:
+        emitter: Qt 信号发射器，接收格式化后的文本。
+    """
+
+    def __init__(self, emitter: _LogEmitter):
+        super().__init__()
+        self._emitter = emitter
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self._emitter.message.emit(msg)
+        except Exception:
+            # 日志系统内部出错不能再抛异常，避免递归
+            pass
+
+
+def _decode_bytes(data: bytes) -> str:
+    """将命令输出的 bytes 解码为字符串（优先使用 chardet 检测）。
+
+    参数:
+        data: 命令输出的原始 bytes。
+
+    返回:
+        解码后的字符串（保证不抛异常）。
+    """
+
+    if not data:
+        return ""
+    try:
+        result = chardet.detect(data)
+        encoding = result.get("encoding")
+        confidence = result.get("confidence", 0.0) or 0.0
+        if encoding and confidence > 0.7:
+            return data.decode(encoding, errors="replace")
+    except Exception:
+        pass
+    return data.decode("utf-8", errors="replace")
+
+
+def run_powershell(command: str) -> tuple[int, str, str]:
+    """执行 PowerShell 命令并返回结果（无窗口）。
+
+    参数:
+        command: PowerShell 命令文本（建议是一条完整的 -Command 内容）。
+
+    返回:
+        (return_code, stdout_text, stderr_text)
+    """
+
+    process = subprocess.Popen(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    stdout, stderr = process.communicate()
+    return process.returncode, _decode_bytes(stdout), _decode_bytes(stderr)
+
+
+def firewall_rule_display_name(listen_port: str) -> str:
+    """生成防火墙规则显示名。
+
+    参数:
+        listen_port: Windows 监听端口（字符串数字）。
+
+    返回:
+        规则 DisplayName，例如: WSL-8080-LAN
+    """
+
+    return f"WSL-{listen_port}-LAN"
+
+
+def ensure_firewall_rule_private_public(listen_port: str) -> tuple[bool, str]:
+    """确保存在“公用/专用”的入站放行规则（TCP/LocalPort）。
+
+    设计说明:
+        - 先 Remove 再 New，保证幂等；重复执行不会累积多条重复规则。
+        - Profile 使用 Private,Public（你提到的“公用/专用”）。
+
+    参数:
+        listen_port: Windows 监听端口（字符串数字）。
+
+    返回:
+        (ok, message)
+    """
+
+    name = firewall_rule_display_name(listen_port)
+    ps = (
+        f'Remove-NetFirewallRule -DisplayName "{name}" -ErrorAction SilentlyContinue; '
+        f'New-NetFirewallRule -DisplayName "{name}" -Direction Inbound -Protocol TCP '
+        f'-LocalPort {listen_port} -Action Allow -Profile Private,Public'
+    )
+    code, out, err = run_powershell(ps)
+    ok = code == 0
+    msg = out.strip() if ok else (err.strip() or out.strip() or f"PowerShell 返回码: {code}")
+    return ok, msg
+
+
+def remove_firewall_rule(listen_port: str) -> tuple[bool, str]:
+    """删除防火墙规则（按 DisplayName）。
+
+    参数:
+        listen_port: Windows 监听端口（字符串数字）。
+
+    返回:
+        (ok, message)
+    """
+
+    name = firewall_rule_display_name(listen_port)
+    ps = f'Remove-NetFirewallRule -DisplayName "{name}" -ErrorAction SilentlyContinue'
+    code, out, err = run_powershell(ps)
+    ok = code == 0
+    msg = out.strip() if ok else (err.strip() or out.strip() or f"PowerShell 返回码: {code}")
+    return ok, msg
+
 
 # 自定义 ItemDelegate
 class CustomItemDelegate(QStyledItemDelegate):
@@ -127,6 +264,18 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("WSL2 端口转发管理器")
         self.setWindowIcon(QIcon("icon.png"))
 
+        # 右侧多日志看板初始化
+        self._log_emitter = _LogEmitter()
+        self._log_emitter.message.connect(self._append_app_log)
+        self._install_ui_log_handler()
+
+        # 设置左右分栏比例（左：规则，右：日志）
+        try:
+            self.ui.splitterMain.setStretchFactor(0, 3)
+            self.ui.splitterMain.setStretchFactor(1, 2)
+        except Exception:
+            pass
+
         # 连接信号和槽
         self.ui.pushButtonRefresh.clicked.connect(self.load_rules)
         self.ui.pushButtonAdd.clicked.connect(self.show_add_dialog)
@@ -147,6 +296,53 @@ class MainWindow(QMainWindow):
         ])
 
         self.load_rules()
+
+    def _install_ui_log_handler(self) -> None:
+        """将 Python logging 输出接入到右侧“应用日志”看板。"""
+
+        handler = QtPlainTextLogHandler(self._log_emitter)
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(handler)
+
+    def _append_app_log(self, text: str) -> None:
+        """追加一行到“应用日志”面板（自动滚动）。
+
+        参数:
+            text: 单行日志文本。
+        """
+
+        try:
+            self.ui.plainTextEditAppLog.appendPlainText(text)
+            cursor = self.ui.plainTextEditAppLog.textCursor()
+            cursor.movePosition(cursor.End)
+            self.ui.plainTextEditAppLog.setTextCursor(cursor)
+        except Exception:
+            pass
+
+    def _append_cmd_log(self, text: str) -> None:
+        """追加内容到“命令输出”面板。
+
+        参数:
+            text: 输出文本（可多行）。
+        """
+
+        try:
+            self.ui.plainTextEditCmdLog.appendPlainText(text)
+        except Exception:
+            pass
+
+    def _append_ps_log(self, text: str) -> None:
+        """追加内容到 PowerShell 面板。
+
+        参数:
+            text: PowerShell 输出文本（可多行）。
+        """
+
+        try:
+            self.ui.plainTextEditPsLog.appendPlainText(text)
+        except Exception:
+            pass
 
     def show_add_dialog(self):
         logger.debug("进入 show_add_dialog")
@@ -202,21 +398,40 @@ class MainWindow(QMainWindow):
                 data_start_index = i + 1
                 break
 
-        # 解析数据行
+        # 解析数据行（严格按 4 列：listen_address listen_port connect_address connect_port）
+        # 示例（中文系统）:
+        # 0.0.0.0         8080        172.29.223.44   1996
+        row_pattern = re.compile(
+            r"^\s*(?P<listen_address>\d{1,3}(?:\.\d{1,3}){3})\s+"
+            r"(?P<listen_port>\d+)\s+"
+            r"(?P<connect_address>\d{1,3}(?:\.\d{1,3}){3})\s+"
+            r"(?P<connect_port>\d+)\s*$"
+        )
+
         for line in lines[data_start_index:]:
-            parts = line.split()
-            if len(parts) >= 4:  # 至少要有 4 个部分
-                listen_address = parts[0]  # 第一个是地址
-                listen_port = parts[1]     # 第二个是端口
-                # 遍历剩余部分，连接地址
-                for i in range(2, len(parts) - 1, 1):
-                    connect_address = parts[i]
-                    rules.append({
-                        "listenPort": listen_port,
-                        "listenAddress": listen_address,
-                        "connectPort": listen_port,  # 使用统一的端口号
-                        "connectAddress": connect_address,
-                    })
+            text = line.strip()
+            if not text:
+                continue
+
+            match = row_pattern.match(text)
+            if match:
+                rules.append({
+                    "listenPort": match.group("listen_port"),
+                    "listenAddress": match.group("listen_address"),
+                    "connectPort": match.group("connect_port"),
+                    "connectAddress": match.group("connect_address"),
+                })
+                continue
+
+            # 兜底解析：遇到格式稍有变化时，尽量按 split 的前 4 列解析
+            parts = text.split()
+            if len(parts) >= 4 and parts[1].isdigit() and parts[3].isdigit():
+                rules.append({
+                    "listenPort": parts[1],
+                    "listenAddress": parts[0],
+                    "connectPort": parts[3],
+                    "connectAddress": parts[2],
+                })
 
         logger.debug(f"解析到的规则：{rules}")
         logger.debug("退出 parse_rules")
@@ -247,6 +462,11 @@ class MainWindow(QMainWindow):
         self.clear_error()
         encoding = None  # 初始化 encoding
         try:
+            self._append_cmd_log(
+                "执行: netsh interface portproxy add v4tov4 "
+                f"listenport={data['listenPort']} listenaddress={data['listenAddress']} "
+                f"connectport={data['connectPort']} connectaddress={data['connectAddress']}"
+            )
             # 获取原始输出
             process = subprocess.Popen(
                 [
@@ -274,16 +494,32 @@ class MainWindow(QMainWindow):
                     error_msg = stderr.decode("utf-8", errors="replace")
                  self.show_error(f"添加规则失败：{error_msg}")
                  logger.error(f"添加规则失败：{error_msg}")
+                 self._append_cmd_log(f"失败: {error_msg}")
                  return
             if encoding and confidence > 0.7:
                 output = stdout.decode(encoding)
             else:
                 output = stdout.decode('utf-8', errors='replace')
             logger.info(f"添加规则成功：{output}")
+            if output.strip():
+                self._append_cmd_log(output.strip())
+
+            # 添加防火墙规则（公用/专用）
+            self._append_ps_log(f'执行: New-NetFirewallRule (Private,Public) 端口 {data["listenPort"]}')
+            ok, msg = ensure_firewall_rule_private_public(data["listenPort"])
+            if ok:
+                self._append_ps_log(f"成功: {firewall_rule_display_name(data['listenPort'])}")
+                if msg:
+                    self._append_ps_log(msg)
+            else:
+                self._append_ps_log(f"失败: {firewall_rule_display_name(data['listenPort'])}")
+                if msg:
+                    self._append_ps_log(msg)
 
         except Exception as ex:
             logger.exception(f"添加规则失败：{ex}")
             self.show_error(f"添加规则失败：{ex}")
+            self._append_cmd_log(f"异常: {ex}")
             return
         finally:
             self.load_rules()
@@ -305,6 +541,10 @@ class MainWindow(QMainWindow):
             self.clear_error()
             encoding = None
             try:
+                self._append_cmd_log(
+                    "执行: netsh interface portproxy delete v4tov4 "
+                    f"listenport={listen_port} listenaddress={listen_address}"
+                )
                 process = subprocess.Popen(
                     [
                         "netsh", "interface", "portproxy", "delete", "v4tov4",
@@ -326,15 +566,31 @@ class MainWindow(QMainWindow):
                     else:
                         error_msg = stderr.decode("utf-8", errors="replace")
                     self.show_error(f"删除规则失败：{error_msg}")
+                    self._append_cmd_log(f"失败: {error_msg}")
                     return
                 if encoding and confidence > 0.7:
                     output = stdout.decode(encoding)
                 else:
                     output = stdout.decode('utf-8', errors='replace')
                 logger.info(f"删除规则成功：{output}")
+                if output.strip():
+                    self._append_cmd_log(output.strip())
+
+                # 删除防火墙规则（按 DisplayName）
+                self._append_ps_log(f'执行: Remove-NetFirewallRule -DisplayName "{firewall_rule_display_name(listen_port)}"')
+                ok, msg = remove_firewall_rule(listen_port)
+                if ok:
+                    self._append_ps_log(f"成功: {firewall_rule_display_name(listen_port)}")
+                    if msg:
+                        self._append_ps_log(msg)
+                else:
+                    self._append_ps_log(f"失败: {firewall_rule_display_name(listen_port)}")
+                    if msg:
+                        self._append_ps_log(msg)
             except Exception as ex:
                 logger.exception(f"删除规则失败：{ex}")
                 self.show_error(f"删除规则失败：{ex}")
+                self._append_cmd_log(f"异常: {ex}")
                 return
             finally:
                 self.load_rules()
